@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+bot-token
+telegram.json
+state.json
+watcher.lock
+*.log
