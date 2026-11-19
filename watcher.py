@@ -4,9 +4,11 @@ import argparse
 import datetime
 import fcntl
 import getpass
+import http.client
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -29,8 +31,186 @@ def request_json(url, data=None):
     except urllib.error.HTTPError as exc:
         # Do not expose request URLs: Telegram includes the token in its URL.
         raise RuntimeError(f'HTTP error {exc.code}') from None
-    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError, http.client.HTTPException):
         raise RuntimeError('Network error or invalid JSON response') from None
+
+
+def request_text(url):
+    req = urllib.request.Request(url, headers={'User-Agent': 'Proxy302-stock-watcher/1.0'})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return response.read().decode()
+    except urllib.error.HTTPError as exc:
+        # Do not expose request URLs: Telegram includes the token in its URL.
+        raise RuntimeError(f'HTTP error {exc.code}') from None
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError, http.client.HTTPException):
+        raise RuntimeError('Network error or invalid response') from None
+
+
+# Minified site bundle, names change every deploy; never execute the downloaded code:
+#   ident={claude:["DE"]},fn=(a,b)=>b.map(p=>{ ... ident[ ... .includes( .country ... available:0 })
+# The map callback's single `=>` is part of this function. Tempered gaps then reject
+# `=>` and `function`, so a later function cannot finish the match. Window: 1000 chars.
+_SCRIPT_SRC = re.compile(
+    r'<script\b[^>]*?\ssrc\s*=\s*(["\'])([^"\']+)\1',
+    re.IGNORECASE,
+)
+_INDEX_SRC = re.compile(r'(?:^|/)assets/index-[A-Za-z0-9_-]+\.js\Z')
+_MAIN_CHUNK = re.compile(r'assets/main-[A-Za-z0-9_-]+\.js')
+_BLOCK_LEAD = re.compile(
+    r'([A-Za-z_$][\w$]*)\s*=\s*(\{[^{}]*\})\s*,\s*'
+    r'[A-Za-z_$][\w$]*\s*=\s*\(\s*[A-Za-z_$][\w$]*\s*,\s*[A-Za-z_$][\w$]*\s*\)\s*=>\s*'
+    r'[A-Za-z_$][\w$]*\s*\.\s*map\s*\('
+)
+_TEMPERED = r'(?:(?!=>|\bfunction\b)[\s\S])*?'
+# \1 is the map's object ident, prepended to the next 1000 characters after map(.
+_BLOCK_TAIL = re.compile(
+    r'\A([A-Za-z_$][\w$]*)' + _TEMPERED + r'=>' + _TEMPERED + r'\1\s*\['
+    + _TEMPERED + r'\.includes\s*\(\s*[A-Za-z_$][\w$]*\s*\.\s*country\s*\)'
+    + _TEMPERED + r'available\s*:\s*0(?!\d)'
+)
+_BLOCK_ENTRY = re.compile(
+    r'\s*(?:([A-Za-z_$][\w$]*)|"((?:\\.|[^"\\])*)"|\'((?:\\.|[^\'\\])*)\')\s*:\s*\[([^\]]*)\]\s*'
+)
+_COUNTRY_CODE = re.compile(r'\A["\']([A-Za-z]{2})["\']\Z')
+
+
+def _chunk_url(index_url, chunk):
+    """Resolve a Vite `assets/main-*.js` path against the index bundle's parent."""
+    marker = '/assets/'
+    pos = index_url.rfind(marker)
+    if pos < 0:
+        raise RuntimeError('Could not read site restock overrides')
+    return urllib.parse.urljoin(index_url[:pos + 1], chunk)
+
+
+def _country_codes(body):
+    body = body.strip()
+    if body == '':
+        return set()
+    codes = set()
+    for part in body.split(','):
+        match = _COUNTRY_CODE.fullmatch(part.strip())
+        if match is None:
+            return None
+        codes.add(match.group(1))
+    return codes
+
+
+def parse_block_object(literal):
+    """Parse {tier:["CC", ...], ...} without evaluating it. None if it is not that shape."""
+    if len(literal) < 2 or literal[0] != '{' or literal[-1] != '}':
+        return None
+    inner = literal[1:-1]
+    if inner.strip() == '':
+        return {}
+    result = {}
+    pos = 0
+    while pos < len(inner):
+        match = _BLOCK_ENTRY.match(inner, pos)
+        if match is None:
+            return None
+        key = match.group(1)
+        if key is None:
+            key = match.group(2) if match.group(2) is not None else match.group(3)
+        codes = _country_codes(match.group(4))
+        if key is None or codes is None:
+            return None
+        result[key] = codes
+        pos = match.end()
+        if pos >= len(inner):
+            return result
+        if inner[pos] != ',':
+            return None
+        pos += 1
+        if pos >= len(inner):
+            return None
+    return result
+
+
+def chunk_overrides(js):
+    """Every {tier: {country, ...}} block successfully parsed from one chunk."""
+    found = []
+    for lead in _BLOCK_LEAD.finditer(js):
+        window = lead.group(1) + js[lead.end():lead.end() + 1000]
+        if _BLOCK_TAIL.match(window) is None:
+            continue
+        parsed = parse_block_object(lead.group(2))
+        if parsed is not None:
+            found.append(parsed)
+    return found
+
+
+def _single_block(blocks):
+    """One override map. Identical duplicates collapse; distinct maps are an error."""
+    unique = []
+    seen = set()
+    for block in blocks:
+        key = tuple(sorted((tier, tuple(sorted(codes))) for tier, codes in block.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(block)
+    if len(unique) == 1:
+        return unique[0]
+    if not unique:
+        raise RuntimeError('Could not read site restock overrides')
+    raise RuntimeError('Ambiguous site restock overrides')
+
+
+def index_bundle_url(fetch_text):
+    html = fetch_text(ORDER_URL)
+    for match in _SCRIPT_SRC.finditer(html):
+        src = match.group(2).strip()
+        if _INDEX_SRC.search(src):
+            return urllib.parse.urljoin(ORDER_URL, src)
+    raise RuntimeError('Could not read site restock overrides')
+
+
+def bundle_overrides(fetch_text, bundle_url):
+    index = fetch_text(bundle_url)
+    chunks = list(dict.fromkeys(_MAIN_CHUNK.findall(index)))
+    if not chunks:
+        raise RuntimeError('Could not read site restock overrides')
+    found = []
+    for chunk in chunks:
+        url = _chunk_url(bundle_url, chunk)
+        try:
+            js = fetch_text(url)
+        except RuntimeError:
+            continue
+        found.extend(chunk_overrides(js))
+    return _single_block(found)
+
+
+def site_overrides(fetch_text):
+    """{tier: {country codes}} the website forces to available 0."""
+    return bundle_overrides(fetch_text, index_bundle_url(fetch_text))
+
+
+def _blocked_sets(blocked):
+    return {tier: set(codes) for tier, codes in blocked.items()}
+
+
+def load_site_overrides(fetch_text, state):
+    """Return (blocked, fresh). fresh is False when a failed lookup fell back to cache."""
+    cached = state.get('site_overrides')
+    cached_ok = isinstance(cached, dict) and isinstance(cached.get('blocked'), dict)
+    try:
+        bundle = index_bundle_url(fetch_text)
+        if cached_ok and cached.get('bundle') == bundle:
+            return _blocked_sets(cached['blocked']), True
+        found = bundle_overrides(fetch_text, bundle)
+    except RuntimeError:
+        if cached_ok:
+            print('Warning: site overrides unavailable, using cached', flush=True)
+            return _blocked_sets(cached['blocked']), False
+        raise
+    state['site_overrides'] = {
+        'bundle': bundle,
+        'blocked': {tier: sorted(codes) for tier, codes in found.items()},
+    }
+    return found, True
 
 
 def telegram(method, **data):
@@ -54,7 +234,7 @@ def save_json(path, value):
     temporary.replace(path)
 
 
-def claude_cities(payload):
+def claude_cities(payload, blocked=()):
     if payload.get('code') != 0:
         raise RuntimeError('Proxy302 API returned an error')
     data = payload['data']
@@ -68,25 +248,29 @@ def claude_cities(payload):
         available = city['available']
         if type(available) is not int or available < 0:
             raise RuntimeError('Invalid stock count')
+        if city['country'] in blocked:
+            available = 0
         cities.append((city['country'], city['city'], available))
     return cities
 
 
-def german_stock(payload):
-    return [(city, n) for country, city, n in claude_cities(payload) if country == 'DE' and n > 0]
+def german_stock(payload, blocked=()):
+    return [(city, n) for country, city, n in claude_cities(payload, blocked)
+            if country == 'DE' and n > 0]
 
 
-def country_stock(payload):
+def country_stock(payload, blocked=()):
     """{country: {city: available}}"""
     result = {}
-    for country, city, n in claude_cities(payload):
+    for country, city, n in claude_cities(payload, blocked):
         cities = result.setdefault(country, {})
         cities[city] = cities.get(city, 0) + n
     return result
 
 
 COUNTRIES = {'DE': ('🇩🇪', 'Германия'), 'US': ('🇺🇸', 'США'), 'GB': ('🇬🇧', 'Великобритания'),
-             'JP': ('🇯🇵', 'Япония'), 'FR': ('🇫🇷', 'Франция'), 'KR': ('🇰🇷', 'Южная Корея')}
+             'JP': ('🇯🇵', 'Япония'), 'FR': ('🇫🇷', 'Франция'), 'KR': ('🇰🇷', 'Южная Корея'),
+             'VN': ('🇻🇳', 'Вьетнам'), 'BR': ('🇧🇷', 'Бразилия')}
 
 
 def message(rows):
@@ -97,12 +281,18 @@ def message(rows):
             'Это наличие по каталогу; перед оплатой проверь остаток. Ничего не куплено автоматически.')
 
 
-def digest(stock):
+def digest(stock, restocking=None):
+    """restocking maps a site-blocked country to its positive raw API total."""
+    restocking = restocking or {}
     blocks = []
     for country, cities in sorted(stock.items(), key=lambda item: -sum(item[1].values())):
         flag, name = COUNTRIES.get(country, ('🏳️', country))
         total = sum(cities.values())
-        lines = [f'{flag} {name}: {total} IP' if total else f'{flag} {name}: нет']
+        raw = restocking.get(country, 0)
+        if raw:
+            lines = [f'{flag} {name}: нет — на сайте «Restocking» (в API: {raw})']
+        else:
+            lines = [f'{flag} {name}: {total} IP' if total else f'{flag} {name}: нет']
         for city, n in sorted(cities.items(), key=lambda item: (-item[1], item[0])):
             lines.append(f'   • {city}: {n}' if n else f'   • {city}: нет')
         blocks.append('\n'.join(lines))
@@ -112,27 +302,37 @@ def digest(stock):
 DIGEST_INTERVAL = datetime.timedelta(hours=6)
 
 
-def check(fetch=None, send=None, now=None):
+def check(fetch=None, send=None, now=None, fetch_text=None):
     payload = (fetch or (lambda: request_json(CATALOG_URL)))()
-    rows = german_stock(payload)
-    totals = country_stock(payload)
+    claude_cities(payload)
     now = now or datetime.datetime.now(datetime.timezone.utc)
     state_path = CONFIG / 'state.json'
     state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    overrides, fresh = load_site_overrides(fetch_text or request_text, state)
+    blocked = overrides.get('claude', set())
+    rows = german_stock(payload, blocked)
+    totals = country_stock(payload, blocked)
+    raw = country_stock(payload)
+    restocking = {country: sum(cities.values()) for country, cities in raw.items()
+                  if country in blocked and sum(cities.values()) > 0}
     if send is None:
         chat_id = json.loads((CONFIG / 'telegram.json').read_text())['chat_id']
         send = lambda text, silent=False: telegram(
             'sendMessage', chat_id=chat_id, text=text, disable_web_page_preview='true',
             disable_notification='true' if silent else 'false')
     available = bool(rows)
-    if available and not state.get('available', False):
+    # A stale override cache must not fire a Germany alert or overwrite availability.
+    if fresh and available and not state.get('available', False):
         send(message(rows))
     # Persist only after successful delivery, so a failed send is retried.
-    state.update(available=available, cities=rows, checked_at=now.isoformat())
+    if fresh:
+        state.update(available=available, cities=rows, checked_at=now.isoformat())
+    else:
+        state['checked_at'] = now.isoformat()
     save_json(state_path, state)
     last = state.get('last_digest')
     if last is None or now - datetime.datetime.fromisoformat(last) >= DIGEST_INTERVAL:
-        send(digest(totals), silent=True)
+        send(digest(totals, restocking), silent=True)
         state['last_digest'] = now.isoformat()
         save_json(state_path, state)
     print(f'Claude/DE: {sum(count for _, count in rows)} available IPs', flush=True)
