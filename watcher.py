@@ -4,6 +4,7 @@ import argparse
 import datetime
 import fcntl
 import getpass
+import http.client
 import json
 import os
 from pathlib import Path
@@ -30,7 +31,7 @@ def request_json(url, data=None):
     except urllib.error.HTTPError as exc:
         # Do not expose request URLs: Telegram includes the token in its URL.
         raise RuntimeError(f'HTTP error {exc.code}') from None
-    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError, http.client.HTTPException):
         raise RuntimeError('Network error or invalid JSON response') from None
 
 
@@ -42,24 +43,31 @@ def request_text(url):
     except urllib.error.HTTPError as exc:
         # Do not expose request URLs: Telegram includes the token in its URL.
         raise RuntimeError(f'HTTP error {exc.code}') from None
-    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
-        raise RuntimeError('Network error or invalid JSON response') from None
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError, http.client.HTTPException):
+        raise RuntimeError('Network error or invalid response') from None
 
 
 # Minified site bundle, names change every deploy; never execute the downloaded code:
-#   ident={claude:["DE"]},fn=(a,b)=>b.map( ... ident[ ... .includes( .country ... available:0)
-_INDEX_BUNDLE = re.compile(r'/assets/index-[A-Za-z0-9_-]+\.js')
+#   ident={claude:["DE"]},fn=(a,b)=>b.map(p=>{ ... ident[ ... .includes( .country ... available:0 })
+# The map callback's single `=>` is part of this function. Tempered gaps then reject
+# `=>` and `function`, so a later function cannot finish the match. Window: 1000 chars.
+_SCRIPT_SRC = re.compile(
+    r'<script\b[^>]*?\ssrc\s*=\s*(["\'])([^"\']+)\1',
+    re.IGNORECASE,
+)
+_INDEX_SRC = re.compile(r'(?:^|/)assets/index-[A-Za-z0-9_-]+\.js\Z')
 _MAIN_CHUNK = re.compile(r'assets/main-[A-Za-z0-9_-]+\.js')
 _BLOCK_LEAD = re.compile(
     r'([A-Za-z_$][\w$]*)\s*=\s*(\{[^{}]*\})\s*,\s*'
     r'[A-Za-z_$][\w$]*\s*=\s*\(\s*[A-Za-z_$][\w$]*\s*,\s*[A-Za-z_$][\w$]*\s*\)\s*=>\s*'
     r'[A-Za-z_$][\w$]*\s*\.\s*map\s*\('
 )
-# \1 is the map's object ident. The search string is that ident plus the next 200 chars.
+_TEMPERED = r'(?:(?!=>|\bfunction\b)[\s\S])*?'
+# \1 is the map's object ident, prepended to the next 1000 characters after map(.
 _BLOCK_TAIL = re.compile(
-    r'\A([A-Za-z_$][\w$]*)[\s\S]{0,200}?\1\s*\['
-    r'[\s\S]*?\.includes\s*\(\s*[A-Za-z_$][\w$]*\s*\.\s*country\s*\)'
-    r'[\s\S]*?available\s*:\s*0(?!\d)'
+    r'\A([A-Za-z_$][\w$]*)' + _TEMPERED + r'=>' + _TEMPERED + r'\1\s*\['
+    + _TEMPERED + r'\.includes\s*\(\s*[A-Za-z_$][\w$]*\s*\.\s*country\s*\)'
+    + _TEMPERED + r'available\s*:\s*0(?!\d)'
 )
 _BLOCK_ENTRY = re.compile(
     r'\s*(?:([A-Za-z_$][\w$]*)|"((?:\\.|[^"\\])*)"|\'((?:\\.|[^\'\\])*)\')\s*:\s*\[([^\]]*)\]\s*'
@@ -67,9 +75,13 @@ _BLOCK_ENTRY = re.compile(
 _COUNTRY_CODE = re.compile(r'\A["\']([A-Za-z]{2})["\']\Z')
 
 
-def _asset_url(path):
-    parts = urllib.parse.urlsplit(ORDER_URL)
-    return urllib.parse.urljoin(f'{parts.scheme}://{parts.netloc}/', path)
+def _chunk_url(index_url, chunk):
+    """Resolve a Vite `assets/main-*.js` path against the index bundle's parent."""
+    marker = '/assets/'
+    pos = index_url.rfind(marker)
+    if pos < 0:
+        raise RuntimeError('Could not read site restock overrides')
+    return urllib.parse.urljoin(index_url[:pos + 1], chunk)
 
 
 def _country_codes(body):
@@ -117,23 +129,42 @@ def parse_block_object(literal):
 
 
 def chunk_overrides(js):
-    """Return {tier: {country, ...}} from one main chunk, or None if the block is absent."""
+    """Every {tier: {country, ...}} block successfully parsed from one chunk."""
+    found = []
     for lead in _BLOCK_LEAD.finditer(js):
-        window = lead.group(1) + js[lead.end():lead.end() + 200]
+        window = lead.group(1) + js[lead.end():lead.end() + 1000]
         if _BLOCK_TAIL.match(window) is None:
             continue
         parsed = parse_block_object(lead.group(2))
         if parsed is not None:
-            return parsed
-    return None
+            found.append(parsed)
+    return found
+
+
+def _single_block(blocks):
+    """One override map. Identical duplicates collapse; distinct maps are an error."""
+    unique = []
+    seen = set()
+    for block in blocks:
+        key = tuple(sorted((tier, tuple(sorted(codes))) for tier, codes in block.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(block)
+    if len(unique) == 1:
+        return unique[0]
+    if not unique:
+        raise RuntimeError('Could not read site restock overrides')
+    raise RuntimeError('Ambiguous site restock overrides')
 
 
 def index_bundle_url(fetch_text):
     html = fetch_text(ORDER_URL)
-    match = _INDEX_BUNDLE.search(html)
-    if match is None:
-        raise RuntimeError('Could not read site restock overrides')
-    return _asset_url(match.group(0))
+    for match in _SCRIPT_SRC.finditer(html):
+        src = match.group(2).strip()
+        if _INDEX_SRC.search(src):
+            return urllib.parse.urljoin(ORDER_URL, src)
+    raise RuntimeError('Could not read site restock overrides')
 
 
 def bundle_overrides(fetch_text, bundle_url):
@@ -141,11 +172,15 @@ def bundle_overrides(fetch_text, bundle_url):
     chunks = list(dict.fromkeys(_MAIN_CHUNK.findall(index)))
     if not chunks:
         raise RuntimeError('Could not read site restock overrides')
+    found = []
     for chunk in chunks:
-        parsed = chunk_overrides(fetch_text(_asset_url(chunk)))
-        if parsed is not None:
-            return parsed
-    raise RuntimeError('Could not read site restock overrides')
+        url = _chunk_url(bundle_url, chunk)
+        try:
+            js = fetch_text(url)
+        except RuntimeError:
+            continue
+        found.extend(chunk_overrides(js))
+    return _single_block(found)
 
 
 def site_overrides(fetch_text):
@@ -158,23 +193,24 @@ def _blocked_sets(blocked):
 
 
 def load_site_overrides(fetch_text, state):
+    """Return (blocked, fresh). fresh is False when a failed lookup fell back to cache."""
     cached = state.get('site_overrides')
     cached_ok = isinstance(cached, dict) and isinstance(cached.get('blocked'), dict)
     try:
         bundle = index_bundle_url(fetch_text)
         if cached_ok and cached.get('bundle') == bundle:
-            return _blocked_sets(cached['blocked'])
+            return _blocked_sets(cached['blocked']), True
         found = bundle_overrides(fetch_text, bundle)
     except RuntimeError:
         if cached_ok:
             print('Warning: site overrides unavailable, using cached', flush=True)
-            return _blocked_sets(cached['blocked'])
+            return _blocked_sets(cached['blocked']), False
         raise
     state['site_overrides'] = {
         'bundle': bundle,
         'blocked': {tier: sorted(codes) for tier, codes in found.items()},
     }
-    return found
+    return found, True
 
 
 def telegram(method, **data):
@@ -272,7 +308,7 @@ def check(fetch=None, send=None, now=None, fetch_text=None):
     now = now or datetime.datetime.now(datetime.timezone.utc)
     state_path = CONFIG / 'state.json'
     state = json.loads(state_path.read_text()) if state_path.exists() else {}
-    overrides = load_site_overrides(fetch_text or request_text, state)
+    overrides, fresh = load_site_overrides(fetch_text or request_text, state)
     blocked = overrides.get('claude', set())
     rows = german_stock(payload, blocked)
     totals = country_stock(payload, blocked)
@@ -285,10 +321,14 @@ def check(fetch=None, send=None, now=None, fetch_text=None):
             'sendMessage', chat_id=chat_id, text=text, disable_web_page_preview='true',
             disable_notification='true' if silent else 'false')
     available = bool(rows)
-    if available and not state.get('available', False):
+    # A stale override cache must not fire a Germany alert or overwrite availability.
+    if fresh and available and not state.get('available', False):
         send(message(rows))
     # Persist only after successful delivery, so a failed send is retried.
-    state.update(available=available, cities=rows, checked_at=now.isoformat())
+    if fresh:
+        state.update(available=available, cities=rows, checked_at=now.isoformat())
+    else:
+        state['checked_at'] = now.isoformat()
     save_json(state_path, state)
     last = state.get('last_digest')
     if last is None or now - datetime.datetime.fromisoformat(last) >= DIGEST_INTERVAL:

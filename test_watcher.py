@@ -246,6 +246,170 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(str(caught.exception), 'Could not read site restock overrides')
         self.assertFalse((self.config / 'state.json').exists())
 
+    def test_stale_cache_does_not_alert_on_unreadable_bundle(self):
+        import datetime
+        now = datetime.datetime(2026, 6, 1, tzinfo=datetime.timezone.utc)
+        earlier = now - datetime.timedelta(hours=6)
+        state_path = self.config / 'state.json'
+        state_path.write_text(json.dumps({
+            'available': False,
+            'cities': [['Sentinel City', 1]],
+            'last_digest': earlier.isoformat(),
+            'site_overrides': {
+                'bundle': 'https://proxy302.com/assets/index-old.js',
+                'blocked': {'claude': []},
+            },
+        }) + '\n')
+        html = '<html><script type="module" crossorigin src="/assets/index-new.js"></script></html>'
+
+        def fetch_text(url):
+            if url == watcher.ORDER_URL:
+                return html
+            raise RuntimeError('HTTP error 503')
+
+        alerts, digests = [], []
+
+        def send(text, silent=False):
+            (digests if silent else alerts).append(text)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.check(fetch=lambda: catalogue(739), send=send, fetch_text=fetch_text, now=now)
+        self.assertIn('Warning: site overrides unavailable, using cached', buf.getvalue())
+        self.assertEqual(alerts, [])
+        self.assertEqual(len(digests), 1)
+        self.assertIn('Frankfurt am Main: 739', digests[0])
+        self.assertNotIn('Restocking', digests[0])
+        saved = json.loads(state_path.read_text())
+        self.assertFalse(saved['available'])
+        self.assertEqual(saved['cities'], [['Sentinel City', 1]])
+        self.assertEqual(saved['checked_at'], now.isoformat())
+        self.assertEqual(saved['site_overrides']['bundle'], 'https://proxy302.com/assets/index-old.js')
+        self.assertEqual(saved['site_overrides']['blocked'], {'claude': []})
+
+    def test_decoy_function_is_not_an_override(self):
+        decoy = (
+            'const x={},decoy=(tier,rows)=>rows.map(row=>x[row]);'
+            'function later(row){return row.includes(row.country)?{...row,available:0}:row}'
+        )
+        site = FakeSite()
+        site.main_body = decoy
+        with self.assertRaises(RuntimeError) as caught:
+            watcher.site_overrides(site.fetch_text)
+        self.assertEqual(str(caught.exception), 'Could not read site restock overrides')
+        self.assertNotEqual(watcher.chunk_overrides(decoy), [{}])
+
+        site.main_body = decoy + chunk_source('{claude:["DE"]}')
+        self.assertEqual(watcher.site_overrides(site.fetch_text), {'claude': {'DE'}})
+
+        site.main_body = chunk_source('{claude:["DE"]}') + chunk_source('{claude:["DE"]}', ident='otherMap')
+        self.assertEqual(watcher.site_overrides(site.fetch_text), {'claude': {'DE'}})
+
+    def test_distinct_blocks_are_ambiguous(self):
+        index = 'https://proxy302.com/assets/index-a.js'
+        left = 'https://proxy302.com/assets/main-decoy.js'
+        right = 'https://proxy302.com/assets/main-real.js'
+        pages = {
+            watcher.ORDER_URL: '<html><script src="/assets/index-a.js"></script></html>',
+            index: '["assets/main-decoy.js","assets/main-real.js"]',
+            left: chunk_source('{claude:["FR"]}', ident='leftMap'),
+            right: chunk_source('{claude:["DE"]}', ident='rightMap'),
+        }
+
+        def fetch_text(url):
+            return pages[url]
+
+        with self.assertRaises(RuntimeError) as caught:
+            watcher.site_overrides(fetch_text)
+        self.assertEqual(str(caught.exception), 'Ambiguous site restock overrides')
+
+        pages[left] = 'var unrelated={a:1};function noop(x,y){return x}'
+        pages[right] = chunk_source('{claude:["DE"]}') + chunk_source('{claude:["US"]}', ident='otherMap')
+        with self.assertRaises(RuntimeError) as caught:
+            watcher.site_overrides(fetch_text)
+        self.assertEqual(str(caught.exception), 'Ambiguous site restock overrides')
+
+    def test_chunk_fetch_error_skips_to_next(self):
+        site = FakeSite(literal='{claude:["DE"]}')
+        original = site.fetch_text
+
+        def fetch_text(url):
+            if url.endswith('main-decoy.js'):
+                raise RuntimeError('HTTP error 404')
+            return original(url)
+
+        self.assertEqual(watcher.site_overrides(fetch_text), {'claude': {'DE'}})
+        self.assertIn('https://proxy302.com/assets/main-real.js', site.fetched)
+
+    def test_incomplete_read_is_runtime_error(self):
+        import http.client
+
+        class Response:
+            def read(self):
+                raise http.client.IncompleteRead(b'')
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with patch('urllib.request.urlopen', return_value=Response()):
+            with self.assertRaises(RuntimeError) as caught:
+                watcher.request_text('https://proxy302.com/product/ai-isp')
+            self.assertEqual(str(caught.exception), 'Network error or invalid response')
+            with self.assertRaises(RuntimeError) as caught:
+                watcher.request_json('https://proxy302.com/v1/proxy/ai-isp/catalog')
+            self.assertEqual(str(caught.exception), 'Network error or invalid JSON response')
+
+    def test_asset_urls_keep_host_and_prefix(self):
+        cdn_index = 'https://cdn.example.org/app/assets/index-x.js'
+        cdn_main = 'https://cdn.example.org/app/assets/main-y.js'
+        pages = {
+            watcher.ORDER_URL: f'<html><script type="module" src="{cdn_index}"></script></html>',
+            cdn_index: 'const assets=["assets/main-y.js"];',
+            cdn_main: chunk_source('{claude:["DE"]}'),
+        }
+        fetched = []
+
+        def fetch_text(url):
+            fetched.append(url)
+            if url not in pages:
+                raise RuntimeError('Could not read site restock overrides')
+            return pages[url]
+
+        state = {}
+        blocked, fresh = watcher.load_site_overrides(fetch_text, state)
+        self.assertTrue(fresh)
+        self.assertEqual(blocked, {'claude': {'DE'}})
+        self.assertEqual(fetched, [watcher.ORDER_URL, cdn_index, cdn_main])
+        self.assertEqual(state['site_overrides']['bundle'], cdn_index)
+
+        root = FakeSite(index='index-x.js', literal='{claude:["DE"]}')
+        state = {}
+        blocked, fresh = watcher.load_site_overrides(root.fetch_text, state)
+        self.assertTrue(fresh)
+        self.assertEqual(blocked, {'claude': {'DE'}})
+        self.assertEqual(state['site_overrides']['bundle'], 'https://proxy302.com/assets/index-x.js')
+        self.assertIn('https://proxy302.com/assets/index-x.js', root.fetched)
+        self.assertIn('https://proxy302.com/assets/main-real.js', root.fetched)
+
+    def test_long_identifiers_still_parse(self):
+        def name(prefix):
+            return prefix + ('X' * 80)
+
+        ident, fn, tier, rows, row, hit = (name(part) for part in
+                                            ('block', 'apply', 'tier', 'rows', 'item', 'held'))
+        live = (
+            f'prefix();const {ident}={{claude:["DE"]}},{fn}=({tier},{rows})=>{rows}.map({row}=>'
+            f'{{var {hit};return({hit}={ident}[{tier}])!=null&&{hit}.includes({row}.country)'
+            f'?{{...{row},available:0}}:{row}}})suffix();'
+        )
+        self.assertGreater(live.split('.map(', 1)[1].index(ident + '['), 200)
+        site = FakeSite()
+        site.main_body = live
+        self.assertEqual(watcher.site_overrides(site.fetch_text), {'claude': {'DE'}})
+
 
 if __name__ == '__main__':
     unittest.main()
