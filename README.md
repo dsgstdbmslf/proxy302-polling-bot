@@ -40,6 +40,8 @@ Run as the same user for all steps (cron jobs run as the user who installed them
 
 - Germany alert on first detection and on each transition from unavailable to available;
   no repeats while stock stays positive.
+- Also reads the website's per-tier country block (Germany for Claude right now) and treats
+  those countries as out of stock, with a cached fallback if the site cannot be read.
 - Digest on the first run, then every 6 hours, sent silently.
 - Failed source requests keep the previous state; failed sends are retried next run.
 - A file lock prevents concurrent runs; state is replaced atomically.
